@@ -1,11 +1,9 @@
 --[[
-    Brood Stacker v1.4 — автостак лесных кемпов паучками Broodmother
+    Brood Stacker v1.5 — автостак лесных кемпов паучками Broodmother
     Umbrella / UCZone API v2.0
 
-    Установка с автообновлением: положить brood_loader.lua в %cheat_dir%/scripts
-    (он сам скачивает этот файл с GitHub). Без автообновления: положить сюда
-    этот файл. Обоих сразу держать не нужно.
-    https://github.com/m03g1983/brood-stacker
+    Установка: положить этот файл в %cheat_dir%/scripts
+    Последняя версия: https://github.com/m03g1983/brood-stacker
     Меню: Heroes -> Hero List -> Broodmother -> Автостак
 
     * Каждый паучок выходит к кемпу в своё время в зависимости от расстояния
@@ -20,7 +18,9 @@
     * Приказы только паучкам (PASSED_UNIT_ONLY) — герой и выделение не трогаются.
       Приказ игрока паучку отпускает его на время из настроек.
     * Напоминание про Spawn Spiderlings — только после прокачки ульты.
-    * Панель на экране можно перетаскивать мышью, пока открыто меню.
+    * Выделенных игроком паучков скрипт не берёт (настройка).
+    * Панель на экране: состояние стаков и когда создавать паучков.
+      Перетаскивается мышью, пока открыто меню, и прилипает к краям экрана.
 
     История версий:
       1.0 — первая версия
@@ -32,6 +32,9 @@
             кнопка выключения первой строкой меню и на панели
       1.4 — автообновление через brood_loader.lua (GitHub), на панели видно,
             запущен ли скрипт через загрузчик
+      1.5 — автозагрузчик убран; вернулась настройка «не брать выделенных
+            паучков»; новая панель: только стаки по кемпам и напоминание,
+            прилипание к краям экрана; иконки в меню
 ]]
 
 local script = {}
@@ -39,7 +42,7 @@ local script = {}
 ---------------------------------------------------------------------------
 -- Константы
 ---------------------------------------------------------------------------
-local VERSION         = "1.4"
+local VERSION         = "1.5"
 local ORDER_ID        = "brood_stacker"
 local HERO_NAME       = "npc_dota_hero_broodmother"
 local SPIDERLING_NAME = "npc_dota_broodmother_spiderling"
@@ -59,7 +62,9 @@ local ARRIVE_BUFFER  = 3.0   -- паучок приходит к точке ож
 local SAFE_UNTIL     = 59.5  -- паучок должен дожить до этой секунды минуты
 local KILL_MODIFIER  = "modifier_kill"
 local AUTO_RADIUS    = 3500
-local LOG_LINES      = 6
+local SNAP           = 24    -- на таком расстоянии панель прилипает к краю экрана
+local POS_MAX_X      = 3840  -- X = максимум -> панель прижата к правому краю
+local POS_MAX_Y      = 2160  -- Y = максимум -> панель прижата к нижнему краю
 
 local FOUNTAIN = {
     radiant = Vector(-7100, -6600, 384),
@@ -128,13 +133,32 @@ ui.types      = grp:MultiCombo("Типы кемпов", TYPE_ITEMS, TYPE_ITEMS)
 ui.own_only   = grp:Switch("Только свой лес", true)
 ui.max_camps  = grp:Slider("Кемпов максимум", 1, 8, 3)
 ui.per_camp   = grp:Slider("Паучков на кемп", 1, 3, 1)
+ui.skip_sel   = grp:Switch("Не брать выделенных паучков", true)
+ui.skip_sel:ToolTip("Паучков, которых вы выделили, скрипт не трогает; выделили уже идущего на стак — он отпускается")
 ui.show       = grp:MultiCombo("Показывать", { "Панель", "Метки на кемпах", "Напоминание" },
                                               { "Панель", "Метки на кемпах", "Напоминание" })
 do -- позиция панели (меняется и перетаскиванием)
     local gear = ui.show:Gear("Позиция панели")
-    ui.panel_x = gear:Slider("X", 0, 3840, 20)
-    ui.panel_y = gear:Slider("Y", 0, 2160, 260)
+    ui.panel_x = gear:Slider("X", 0, POS_MAX_X, 20)
+    ui.panel_y = gear:Slider("Y", 0, POS_MAX_Y, 260)
 end
+
+-- Иконки Font Awesome (если версия меню их не поддерживает — просто без них)
+local function icon(widget, glyph)
+    if widget then pcall(function() widget:Icon(glyph) end) end
+end
+icon(stack_tab,     "\u{f717}")  -- spider
+icon(ui.toggle_btn, "\u{f011}")  -- power
+icon(ui.enabled,    "\u{f00c}")  -- check
+icon(ui.toggle_key, "\u{f11c}")  -- keyboard
+icon(ui.mode,       "\u{f0e8}")  -- sitemap
+icon(ui.camps,      "\u{f3c5}")  -- map marker
+icon(ui.types,      "\u{f5fd}")  -- layers
+icon(ui.own_only,   "\u{f1bb}")  -- tree
+icon(ui.max_camps,  "\u{f292}")  -- hashtag
+icon(ui.per_camp,   "\u{f0c0}")  -- users
+icon(ui.skip_sel,   "\u{f05e}")  -- ban
+icon(ui.show,       "\u{f06e}")  -- eye
 
 -- Показываем только то, что относится к выбранному режиму
 ui.mode:SetCallback(function()
@@ -159,6 +183,7 @@ local logbuf = {}
 local reminder = { text = nil, last_minute = -1 }
 local spider_counter = 0
 local drag = nil
+local last_targets = {}
 
 ---------------------------------------------------------------------------
 -- Утилиты
@@ -531,9 +556,10 @@ local function assign_spiders(targets, sec, minute)
     end
 
     local t = now()
+    local sel = ui.skip_sel:Get() and selected_set() or {}
     local pool = {}
     for idx, sp in pairs(spiders) do
-        if sp.camp == nil and (released[idx] or 0) < t then table.insert(pool, sp) end
+        if sp.camp == nil and (released[idx] or 0) < t and not sel[idx] then table.insert(pool, sp) end
     end
 
     local need = ui.per_camp:Get()
@@ -728,15 +754,19 @@ local function update_reminder(targets, sec, minute)
     end
     if have >= need then return end
 
+    -- До какого времени нужны паучки: самый ранний удар минус ~10 с на дорогу
+    local first_hit = 53
+    for i, c in ipairs(targets) do
+        local h = hit_second(c.ctype)
+        if i == 1 or h < first_hit then first_hit = h end
+    end
+    local deadline = math.max(sec, first_hit - 10)
+
     local cd = Ability.GetCooldown(ult) or 0
     if cd > 0 then
-        reminder.text = string.format("Паучков %d/%d, ульта через %d с", have, need, math.ceil(cd))
+        reminder.text = string.format("Ульта откатится через %d с", math.ceil(cd))
     else
-        reminder.text = string.format("Кастуй Spawn Spiderlings: не хватает %d", need - have)
-    end
-    if reminder.last_minute ~= minute then
-        reminder.last_minute = minute
-        log(reminder.text)
+        reminder.text = "Создай паучков до " .. fmt_time(minute * 60 + deadline)
     end
 end
 
@@ -748,6 +778,7 @@ local function reset()
     my_hero, my_player, my_pid, my_team = nil, nil, -1, nil
     reminder = { text = nil, last_minute = -1 }
     spider_counter = 0
+    last_targets = {}
 end
 
 local function is_brood()
@@ -785,7 +816,16 @@ function script.OnUpdate()
     local t = now()
 
     refresh_spiders()
+    -- Выделенные игроком паучки — его, скрипт их отпускает
+    if ui.skip_sel:Get() then
+        local sel = selected_set()
+        for idx, sp in pairs(spiders) do
+            if sel[idx] and sp.camp then unassign(sp, "выделен игроком, отпущен") end
+        end
+    end
+
     local targets = target_camps()
+    last_targets = targets
     assign_spiders(targets, sec, minute)
     update_reminder(targets, sec, minute)
 
@@ -849,7 +889,60 @@ local function text(size, str, x, y, col)
     Render.Text(font, size, str, Vec2(x, y), col)
 end
 
--- Перетаскивание панели ЛКМ, пока открыто меню
+-- Цвета панели
+local P_BG     = Color(18, 18, 24, 225)
+local P_HEAD   = Color(30, 30, 40, 240)
+local P_ACCENT = Color(160, 110, 255)
+local P_ROW    = Color(255, 255, 255, 10)
+local P_PIP    = Color(70, 70, 85)
+local P_ON     = Color(60, 170, 90, 235)
+local P_OFF    = Color(190, 60, 60, 235)
+
+-- Состояние кемпа по его паучкам (самое «продвинутое»)
+local STATE_RANK = { [ST.TO_WAIT] = 1, [ST.WAITING] = 2, [ST.AGGRO] = 3, [ST.RETREAT] = 4 }
+local STATE_VIEW = {
+    [0] = { "нет паучков", C_DIM },
+    [1] = { "в пути",      C_TEXT },
+    [2] = { "ждёт",        C_GOOD },
+    [3] = { "агр",         C_BAD },
+    [4] = { "увод",        C_WARN },
+}
+
+local function camp_state(camp)
+    local rank = 0
+    for idx in pairs(camp.spiders) do
+        local sp = spiders[idx]
+        local r = sp and STATE_RANK[sp.state] or 0
+        if r > rank then rank = r end
+    end
+    return rank
+end
+
+-- Какие кемпы показывать: цели, кемпы с паучками, выбранные вручную
+local function panel_camps()
+    local list, seen = {}, {}
+    local function push(c) if c and not seen[c.id] then seen[c.id] = true table.insert(list, c) end end
+    for _, c in ipairs(last_targets) do push(c) end
+    local manual = ui.mode:Get() == 1
+    for _, id in ipairs(camp_order) do
+        local c = camps[id]
+        if count_camp_spiders(c) > 0 or (manual and camp_selected(id)) then push(c) end
+    end
+    return list
+end
+
+-- Позиция с учётом прилипания: максимум слайдера = прижата к правому/нижнему краю
+local function panel_pos(w, h)
+    local scr = Render.ScreenSize()
+    local x, y = ui.panel_x:Get(), ui.panel_y:Get()
+    if x >= POS_MAX_X then x = scr.x - w end
+    if y >= POS_MAX_Y then y = scr.y - h end
+    x = math.max(0, math.min(x, scr.x - w))
+    y = math.max(0, math.min(y, scr.y - h))
+    return x, y
+end
+
+-- Перетаскивание ЛКМ, пока открыто меню; у краёв экрана панель прилипает
 local function handle_drag(x, y, w, h, btn)
     local mouse = Input.IsKeyDown(Enum.ButtonCode.KEY_MOUSE1, true)
     if not Menu.Opened() or not mouse then drag = nil return end
@@ -859,70 +952,110 @@ local function handle_drag(x, y, w, h, btn)
         if Input.IsCursorInRect(x, y, w, h) then drag = { dx = cx - x, dy = cy - y } end
         return
     end
-    ui.panel_x:Set(math.floor(cx - drag.dx))
-    ui.panel_y:Set(math.floor(cy - drag.dy))
+    local scr = Render.ScreenSize()
+    local nx, ny = cx - drag.dx, cy - drag.dy
+    if nx < SNAP then nx = 0 elseif nx + w > scr.x - SNAP then nx = POS_MAX_X end
+    if ny < SNAP then ny = 0 elseif ny + h > scr.y - SNAP then ny = POS_MAX_Y end
+    ui.panel_x:Set(math.floor(nx))
+    ui.panel_y:Set(math.floor(ny))
+end
+
+local function draw_pips(x, cy, filled, max)
+    for i = 1, max do
+        local col = i <= filled and P_ACCENT or P_PIP
+        Render.FilledCircle(Vec2(x + (i - 1) * 11 + 4, cy), 4, col)
+    end
+    return max * 11
 end
 
 local function draw_panel()
-    local x, y = ui.panel_x:Get(), ui.panel_y:Get()
-    local lines = {}
-    local function add(str, col) table.insert(lines, { str, col or C_TEXT }) end
-
-    add(string.format("Brood Stacker v%s%s  %s", VERSION,
-        BROOD_STACKER_LOADER and " (авто)" or "", fmt_time(dota_time())),
-        ui.enabled:Get() and C_TITLE or C_DIM)
-    if reminder.text then add("⚠ " .. reminder.text, C_WARN) end
-    if ui.mode:Get() == 1 and #(ui.camps:ListEnabled() or {}) == 0 then
-        add("Выберите кемпы в меню", C_WARN)
-    end
-
-    local list = {}
-    for _, sp in pairs(spiders) do table.insert(list, sp) end
-    table.sort(list, function(a, b) return a.num < b.num end)
-    for _, sp in ipairs(list) do
-        local col = C_TEXT
-        if sp.state == ST.AGGRO then col = C_BAD
-        elseif sp.state == ST.RETREAT then col = C_WARN
-        elseif sp.state == ST.WAITING then col = C_GOOD
-        elseif sp.state == ST.IDLE or sp.state == ST.MANUAL then col = C_DIM end
-        local life = life_left(sp.npc)
-        local life_s = life == math.huge and "" or string.format("  %dс", math.max(0, math.floor(life)))
-        add(string.format("#%d  %s%s%s", sp.num, sp.state, sp.camp and ("  · " .. sp.camp) or "", life_s), col)
-    end
-
-    for i = 1, math.min(#logbuf, LOG_LINES) do
-        local e = logbuf[i]
-        add(string.format("%s  %s", fmt_time(e.time), e.text), i == 1 and C_TEXT or C_DIM)
-    end
-
-    local size, lh = 14, 17
-    local w = 0
-    for _, l in ipairs(lines) do
-        local ts = Render.TextSize(font, size, l[1])
-        if ts.x > w then w = ts.x end
-    end
-    local btn_w = 96
-    local bx, by, bw, bh = x - 8, y - 6, w + 18 + btn_w, #lines * lh + 10
-
-    -- Кнопка вкл/выкл в заголовке панели (клик — пока открыто меню)
     local on = ui.enabled:Get()
-    local btn = { x = bx + bw - btn_w - 4, y = by + 3, w = btn_w, h = lh + 2 }
+    local pad, head_h, row_h = 10, 28, 22
+    local max = ui.max_stacks:Get()
+
+    -- Содержимое
+    local rows = {}
+    local note = nil
+    if reminder.text then note = reminder.text end
+    if ui.mode:Get() == 1 and #(ui.camps:ListEnabled() or {}) == 0 then
+        note = note or "Выберите кемпы в меню"
+    end
+    for _, c in ipairs(panel_camps()) do
+        local stacks = camp_stacks(c)
+        local view = stacks >= max and { "готово", P_ACCENT } or STATE_VIEW[camp_state(c)]
+        table.insert(rows, { name = c.id, stacks = math.min(stacks, max), state = view[1], col = view[2] })
+    end
+
+    -- Ширина по самому длинному
+    local title = "Brood Stacker"
+    local ver = "v" .. VERSION
+    local clock = fmt_time(dota_time())
+    local tw = Render.TextSize(font, 15, title).x + Render.TextSize(font, 12, ver).x
+    local pill_w = 46
+    local w = math.max(250, tw + Render.TextSize(font, 13, clock).x + pill_w + pad * 4 + 6)
+    local name_w, state_w = 0, 0
+    for _, r in ipairs(rows) do
+        name_w = math.max(name_w, Render.TextSize(font, 13, r.name).x)
+        state_w = math.max(state_w, Render.TextSize(font, 13, r.state).x)
+    end
+    w = math.max(w, pad * 2 + name_w + 14 + max * 11 + 14 + state_w)
+    if note then w = math.max(w, pad * 2 + 16 + Render.TextSize(font, 13, note).x) end
+    if #rows == 0 then rows = nil end
+
+    local h = head_h + (note and row_h + 4 or 0) + (rows and #rows * row_h or row_h) + pad
+    local x, y = panel_pos(w, h)
+
+    -- Кнопка вкл/выкл (клик, пока открыто меню)
+    local pill = { x = x + w - pad - pill_w, y = y + 6, w = pill_w, h = head_h - 12 }
     if Menu.Opened() and Input.IsKeyDownOnce(Enum.ButtonCode.KEY_MOUSE1, true)
-        and Input.IsCursorInRect(btn.x, btn.y, btn.w, btn.h) then
+        and Input.IsCursorInRect(pill.x, pill.y, pill.w, pill.h) then
         toggle_script()
         on = ui.enabled:Get()
     end
+    handle_drag(x, y, w, h, pill)
 
-    handle_drag(bx, by, bw, bh, btn)
-    Render.FilledRect(Vec2(bx, by), Vec2(bx + bw, by + bh), C_BG, 6)
-    Render.FilledRect(Vec2(btn.x, btn.y), Vec2(btn.x + btn.w, btn.y + btn.h),
-        on and Color(170, 50, 50, 230) or Color(50, 140, 60, 230), 4)
-    local label = on and "Выключить" or "Включить"
-    local ls = Render.TextSize(font, 13, label)
-    text(13, label, btn.x + (btn.w - ls.x) / 2, btn.y + (btn.h - ls.y) / 2, C_TEXT)
+    -- Фон и шапка
+    Render.FilledRect(Vec2(x, y), Vec2(x + w, y + h), P_BG, 8)
+    Render.FilledRect(Vec2(x, y), Vec2(x + w, y + head_h), P_HEAD, 8)
+    Render.FilledRect(Vec2(x, y + head_h - 2), Vec2(x + w, y + head_h), on and P_ACCENT or P_PIP)
 
-    for i, l in ipairs(lines) do
-        text(size, l[1], x, y + (i - 1) * lh, l[2])
+    local ty = y + (head_h - 15) / 2 - 1
+    text(15, title, x + pad, ty, on and C_TEXT or C_DIM)
+    local title_w = Render.TextSize(font, 15, title).x
+    text(12, ver, x + pad + title_w + 5, ty + 3, C_DIM)
+    local cw = Render.TextSize(font, 13, clock).x
+    text(13, clock, pill.x - 8 - cw, ty + 1, C_DIM)
+
+    Render.FilledRect(Vec2(pill.x, pill.y), Vec2(pill.x + pill.w, pill.y + pill.h), on and P_ON or P_OFF, pill.h / 2)
+    local plabel = on and "ВКЛ" or "ВЫКЛ"
+    local ps = Render.TextSize(font, 11, plabel)
+    text(11, plabel, pill.x + (pill.w - ps.x) / 2, pill.y + (pill.h - ps.y) / 2, C_TEXT)
+
+    local cy = y + head_h + 4
+
+    -- Напоминание
+    if note then
+        Render.FilledRect(Vec2(x + 6, cy), Vec2(x + w - 6, cy + row_h), Color(255, 190, 60, 40), 4)
+        Render.FilledRect(Vec2(x + 6, cy), Vec2(x + 9, cy + row_h), C_WARN, 1)
+        text(13, note, x + pad + 6, cy + (row_h - 13) / 2 - 1, C_WARN)
+        cy = cy + row_h + 4
+    end
+
+    -- Кемпы
+    if not rows then
+        text(13, on and "Нет кемпов для стака" or "Скрипт выключен", x + pad, cy + (row_h - 13) / 2 - 1, C_DIM)
+        return
+    end
+    for i, r in ipairs(rows) do
+        if i % 2 == 0 then Render.FilledRect(Vec2(x + 4, cy), Vec2(x + w - 4, cy + row_h), P_ROW, 3) end
+        local my = cy + row_h / 2
+        Render.FilledCircle(Vec2(x + pad + 3, my), 3, r.col)
+        text(13, r.name, x + pad + 12, my - 8, C_TEXT)
+        local px = x + pad + 12 + name_w + 12
+        draw_pips(px, my, r.stacks, max)
+        local sw = Render.TextSize(font, 13, r.state).x
+        text(13, r.state, x + w - pad - sw, my - 8, r.col)
+        cy = cy + row_h
     end
 end
 
@@ -938,11 +1071,11 @@ local function draw_marks()
                 local stacks, max = camp_stacks(c), ui.max_stacks:Get()
                 local col, status
                 if stacks >= max then
-                    col, status = C_DIM, "лимит"
-                elseif n > 0 then
-                    col, status = C_GOOD, string.format("паучков %d", n)
+                    col, status = P_ACCENT, "готово"
                 else
-                    col, status = C_WARN, "нет паучка"
+                    local view = STATE_VIEW[camp_state(c)]
+                    status, col = view[1], view[2]
+                    if n == 0 then col = C_WARN end
                 end
                 local l1 = id
                 local l2 = string.format("%s · стаков %d/%d", status, stacks, max)
