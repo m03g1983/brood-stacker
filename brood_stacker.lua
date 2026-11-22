@@ -1,5 +1,5 @@
 --[[
-    Brood Stacker v1.6 — автостак лесных кемпов паучками Broodmother
+    Brood Stacker v1.7 — автостак лесных кемпов паучками Broodmother
     Umbrella / UCZone API v2.0
 
     Установка: положить этот файл в %cheat_dir%/scripts
@@ -8,8 +8,8 @@
 
     * Каждый паучок выходит к кемпу в своё время в зависимости от расстояния
       (дальние раньше, ближние позже), но не раньше :40 (настраивается).
-    * Направление отвода у каждого кемпа своё: подальше от других кемпов
-      и от точек отвода соседних паучков, чтобы крипы не перецеплялись.
+    * Направление увода: короткий выход из спавн-бокса, открытая местность
+      без стен и деревьев, не через другие кемпы и не навстречу соседям.
     * Паучок ждёт у края кемпа, в нужную секунду бьёт крипа и уводит его,
       чтобы к xx:00 спавн-бокс был пуст. После стака паучок снова свободен.
     * Лимита стаков нет: чем больше стаков на кемпе, тем раньше паучок бьёт.
@@ -23,6 +23,7 @@
     * Выделенных игроком паучков скрипт не берёт (настройка).
     * Панель на экране: состояние стаков и когда создавать паучков.
       Перетаскивается мышью, пока открыто меню, и прилипает к краям экрана.
+      Кнопка ВКЛ/ВЫКЛ на панели нажимается и без открытого меню.
 
     История версий:
       1.0 — первая версия
@@ -40,6 +41,9 @@
       1.6 — паучки обходят кемпы по пути (не проходят сквозь спавн-бокс);
             лимит стаков убран, удар раньше на каждый стак; после 3 неудач
             подряд кемп ждёт фарма
+      1.7 — увод по правилам гайдов: короткий выход из бокса, открытая
+            местность без стен и деревьев (GridNav/Trees), не через другие
+            кемпы; кнопка ВКЛ/ВЫКЛ на панели работает без открытия меню
 ]]
 
 local script = {}
@@ -47,7 +51,7 @@ local script = {}
 ---------------------------------------------------------------------------
 -- Константы
 ---------------------------------------------------------------------------
-local VERSION         = "1.6"
+local VERSION         = "1.7"
 local ORDER_ID        = "brood_stacker"
 local HERO_NAME       = "npc_dota_hero_broodmother"
 local SPIDERLING_NAME = "npc_dota_broodmother_spiderling"
@@ -191,6 +195,8 @@ local logbuf = {}
 local reminder = { text = nil, last_minute = -1 }
 local spider_counter = 0
 local drag = nil
+local pill_rect = nil        -- где на экране кнопка ВКЛ/ВЫКЛ панели
+local pill_swallow = false   -- клик по кнопке съеден, отпускание тоже съедаем
 local last_targets = {}
 
 ---------------------------------------------------------------------------
@@ -260,6 +266,8 @@ local function rebuild_camps()
                 handle = c,
                 center = center,
                 half   = math.max(box.max.x - box.min.x, box.max.y - box.min.y) / 2,
+                hx     = (box.max.x - box.min.x) / 2,
+                hy     = (box.max.y - box.min.y) / 2,
                 ctype  = ctype,
                 own    = radiant_side == own_radiant,
             })
@@ -307,41 +315,95 @@ local function polar(center, ang, len)
     return Vector(center.x + math.cos(ang) * len, center.y + math.sin(ang) * len, center.z)
 end
 
--- Направление отвода выбирается раз в минуту для каждого кемпа:
--- подальше от других кемпов и от точек отвода соседних паучков,
--- но по возможности в сторону своего фонтана.
+-- Направление увода (по советам гайдов по стаку):
+--   1) крипы должны как можно быстрее покинуть спавн-бокс — короткий выход;
+--   2) увод по открытой местности: без стен, обрывов и деревьев, иначе крипы
+--      застревают/срезают и возвращаются в бокс раньше :00;
+--   3) не через другие кемпы и не навстречу уводу соседних паучков.
+-- Местность (1, 2) считается один раз на кемп, соседи (3) — каждую минуту.
+local DIR_STEP = 15  -- шаг перебора направлений, градусы
+
+local function traversable(pos)
+    if not GridNav or not GridNav.IsTraversable then return true end
+    local ok, r = pcall(GridNav.IsTraversable, pos)
+    if not ok then return true end
+    return r == true or r == 1
+end
+
+local function trees_near(pos, radius)
+    if not Trees or not Trees.InRadius then return 0 end
+    local ok, list = pcall(Trees.InRadius, pos, radius, true)
+    if not ok or type(list) ~= "table" then return 0 end
+    return #list
+end
+
+-- Длина выхода из прямоугольного бокса по направлению ang
+local function box_exit(camp, ang)
+    local c, sn = math.abs(math.cos(ang)), math.abs(math.sin(ang))
+    local tx = c > 0.001 and camp.hx / c or math.huge
+    local ty = sn > 0.001 and camp.hy / sn or math.huge
+    return math.min(tx, ty)
+end
+
+local function terrain_scores(camp, len)
+    if camp.terrain and camp.terrain_len == len then return camp.terrain end
+    local res = {}
+    for k = 0, 360 / DIR_STEP - 1 do
+        local ang = math.rad(k * DIR_STEP)
+        local exit = box_exit(camp, ang)
+        -- насколько далеко по лучу можно пройти без стен/обрывов
+        local open, trees = len, 0
+        local d = exit + 100
+        while d <= len do
+            local p = polar(camp.center, ang, d)
+            if not traversable(p) then open = d break end
+            trees = trees + trees_near(p, 110)
+            d = d + 100
+        end
+        res[k] = { ang = ang, score = open * 1.5 - exit * 2 - trees * 80, open = open }
+    end
+    camp.terrain, camp.terrain_len = res, len
+    return res
+end
+
 local function choose_dir(camp, minute)
     if camp.dir and camp.dir_minute == minute then return camp.dir end
 
+    local len = camp.half + wait_gap(camp) + ui.retreat:Get()
     local f = my_fountain()
     local base = atan2(f.y - camp.center.y, f.x - camp.center.x)
-    local len = camp.half + wait_gap(camp) + ui.retreat:Get()
     local best_ang, best_score = base, -math.huge
 
-    for k = -6, 6 do  -- ±120° с шагом 20°
-        local ang = base + math.rad(k * 20)
-        local p = polar(camp.center, ang, len)
-        local mid = polar(camp.center, ang, len / 2)
-        local clear = 1500  -- дальше этого «запас» уже не важен
+    for _, t in pairs(terrain_scores(camp, len)) do
+        local p = polar(camp.center, t.ang, len)
+        local mid = polar(camp.center, t.ang, len / 2)
+        local clear = 1200  -- дальше этого запас уже не важен
         for _, id in ipairs(camp_order) do
             local oc = camps[id]
             if oc ~= camp then
-                -- путь отвода не должен проходить через чужой кемп
                 local d = math.min(dist2d(p, oc.center), dist2d(mid, oc.center)) - oc.half
                 if d < clear then clear = d end
-                -- и не должен пересекаться с отводом соседей в эту минуту
                 if oc.ret_pt and oc.dir_minute == minute then
                     local d2 = math.min(dist2d(p, oc.ret_pt), dist2d(mid, oc.ret_pt))
                     if d2 < clear then clear = d2 end
                 end
             end
         end
-        local score = clear - math.abs(k) * 20 * 4  -- штраф 4 ед. за градус от фонтана
-        if score > best_score then best_ang, best_score = ang, score end
+        -- лёгкое предпочтение стороны своего фонтана (безопаснее для паучка)
+        local dev = math.abs((t.ang - base + math.pi) % (2 * math.pi) - math.pi)
+        local score = t.score + clear * 1.2 - math.deg(dev) * 1.0
+        if score > best_score then best_ang, best_score = t.ang, score end
     end
 
+    -- если по лучу дальше стена — уводим только до неё
+    local open = len
+    for _, t in pairs(camp.terrain) do
+        if t.ang == best_ang then open = t.open end
+    end
+    local ret_len = math.max(camp.half + wait_gap(camp) + 300, math.min(len, open - 60))
+
     camp.dir, camp.dir_minute = best_ang, minute
-    camp.ret_pt = polar(camp.center, best_ang, len)
+    camp.ret_pt = polar(camp.center, best_ang, ret_len)
     return best_ang
 end
 
@@ -933,6 +995,24 @@ function script.OnPrepareUnitOrders(data)
     return true
 end
 
+-- Клик по кнопке ВКЛ/ВЫКЛ на панели — без открытия меню Umbrella.
+-- Клик не уходит в игру (герой не побежит в эту точку).
+function script.OnKeyEvent(data)
+    if data.key ~= Enum.ButtonCode.KEY_MOUSE1 then return true end
+    if data.event == Enum.EKeyEvent.EKeyEvent_KEY_DOWN then
+        local r = pill_rect
+        if r and Input.IsCursorInRect(r.x, r.y, r.w, r.h) then
+            toggle_script()
+            pill_swallow = true
+            return false
+        end
+    elseif data.event == Enum.EKeyEvent.EKeyEvent_KEY_UP and pill_swallow then
+        pill_swallow = false
+        return false
+    end
+    return true
+end
+
 function script.OnGameEnd()
     reset()
 end
@@ -1035,6 +1115,7 @@ local function draw_badge(x, cy, stacks)
 end
 
 local function draw_panel()
+    pill_rect = nil
     local on = ui.enabled:Get()
     local pad, head_h, row_h = 10, 28, 22
     -- Содержимое
@@ -1068,13 +1149,9 @@ local function draw_panel()
     local h = head_h + (note and row_h + 4 or 0) + (rows and #rows * row_h or row_h) + pad
     local x, y = panel_pos(w, h)
 
-    -- Кнопка вкл/выкл (клик, пока открыто меню)
+    -- Кнопка вкл/выкл: клик ловится в OnKeyEvent, меню открывать не нужно
     local pill = { x = x + w - pad - pill_w, y = y + 6, w = pill_w, h = head_h - 12 }
-    if Menu.Opened() and Input.IsKeyDownOnce(Enum.ButtonCode.KEY_MOUSE1, true)
-        and Input.IsCursorInRect(pill.x, pill.y, pill.w, pill.h) then
-        toggle_script()
-        on = ui.enabled:Get()
-    end
+    pill_rect = pill
     handle_drag(x, y, w, h, pill)
 
     -- Фон и шапка
@@ -1154,6 +1231,7 @@ local function draw_marks()
 end
 
 function script.OnDraw()
+    pill_rect = nil
     if not is_brood() then return end
     if not font then font = Render.LoadFont("MuseoSansEx", Enum.FontCreate.FONTFLAG_ANTIALIAS) end
     if shown("Метки на кемпах") then draw_marks() end
