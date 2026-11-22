@@ -1,5 +1,5 @@
 --[[
-    Brood Stacker v1.5 — автостак лесных кемпов паучками Broodmother
+    Brood Stacker v1.6 — автостак лесных кемпов паучками Broodmother
     Umbrella / UCZone API v2.0
 
     Установка: положить этот файл в %cheat_dir%/scripts
@@ -12,7 +12,9 @@
       и от точек отвода соседних паучков, чтобы крипы не перецеплялись.
     * Паучок ждёт у края кемпа, в нужную секунду бьёт крипа и уводит его,
       чтобы к xx:00 спавн-бокс был пуст. После стака паучок снова свободен.
-    * Кемп, застаканный максимум раз (по умолчанию 3), больше не стакается.
+    * Лимита стаков нет: чем больше стаков на кемпе, тем раньше паучок бьёт.
+    * Если стак не прошёл 3 раза подряд, кемп пропускается, пока его не зафармят.
+    * По пути к точке ожидания паучок обходит спавн-боксы кемпов.
     * Если паучок умрёт раньше, чем закончится стак (modifier_kill),
       на кемп доводится ещё один — тот, кому жить дольше.
     * Приказы только паучкам (PASSED_UNIT_ONLY) — герой и выделение не трогаются.
@@ -35,6 +37,9 @@
       1.5 — автозагрузчик убран; вернулась настройка «не брать выделенных
             паучков»; новая панель: только стаки по кемпам и напоминание,
             прилипание к краям экрана; иконки в меню
+      1.6 — паучки обходят кемпы по пути (не проходят сквозь спавн-бокс);
+            лимит стаков убран, удар раньше на каждый стак; после 3 неудач
+            подряд кемп ждёт фарма
 ]]
 
 local script = {}
@@ -42,7 +47,7 @@ local script = {}
 ---------------------------------------------------------------------------
 -- Константы
 ---------------------------------------------------------------------------
-local VERSION         = "1.5"
+local VERSION         = "1.6"
 local ORDER_ID        = "brood_stacker"
 local HERO_NAME       = "npc_dota_hero_broodmother"
 local SPIDERLING_NAME = "npc_dota_broodmother_spiderling"
@@ -62,6 +67,9 @@ local ARRIVE_BUFFER  = 3.0   -- паучок приходит к точке ож
 local SAFE_UNTIL     = 59.5  -- паучок должен дожить до этой секунды минуты
 local KILL_MODIFIER  = "modifier_kill"
 local AUTO_RADIUS    = 3500
+local FAIL_LIMIT     = 3     -- столько неудач подряд — кемп ждёт фарма
+local EARLY_MAX      = 2.5   -- максимум, на сколько сек раньше бить из-за стаков
+local AVOID_MARGIN   = 140   -- запас вокруг спавн-бокса при обходе
 local SNAP           = 24    -- на таком расстоянии панель прилипает к краю экрана
 local POS_MAX_X      = 3840  -- X = максимум -> панель прижата к правому краю
 local POS_MAX_Y      = 2160  -- Y = максимум -> панель прижата к нижнему краю
@@ -113,7 +121,7 @@ ui.enabled:SetCallback(function() update_toggle_label() end, true)
 
 do -- шестерёнка с тонкими настройками
     local gear = ui.enabled:Gear("Настройки")
-    ui.max_stacks = gear:Slider("Макс. стаков на кемп", 1, 5, 3)
+    ui.early_step = gear:Slider("Раньше за каждый стак (сек)", 0.0, 1.0, 0.4, "%.1f")
     -- Названия новые ("Удар"), чтобы подтянулись новые значения по умолчанию,
     -- а не сохранённые в конфиге старые
     ui.t_small    = gear:Slider("Удар: малый (сек)", 50.0, 58.0, 55.0, "%.1f")
@@ -344,6 +352,40 @@ local function camp_points(camp, minute)
     return wait, camp.ret_pt
 end
 
+-- Расстояние от точки p до отрезка a-b
+local function seg_dist(p, a, b)
+    local abx, aby = b.x - a.x, b.y - a.y
+    local l2 = abx * abx + aby * aby
+    if l2 < 1 then return dist2d(p, a), 0 end
+    local t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / l2
+    t = math.max(0, math.min(1, t))
+    local dx, dy = a.x + abx * t - p.x, a.y + aby * t - p.y
+    return math.sqrt(dx * dx + dy * dy), t
+end
+
+-- Если прямой путь проходит через спавн-бокс какого-то кемпа,
+-- возвращаем промежуточную точку в обход (по дуге вокруг кемпа)
+local function detour(from, to)
+    local hit_camp, hit_t = nil, math.huge
+    for _, id in ipairs(camp_order) do
+        local c = camps[id]
+        local r = c.half + AVOID_MARGIN
+        -- паучок уже внутри или цель внутри — не обходим (пусть выходит/заходит)
+        if dist2d(from, c.center) > r and dist2d(to, c.center) > r * 0.9 then
+            local d, t = seg_dist(c.center, from, to)
+            if d < r and t < hit_t then hit_camp, hit_t = c, t end
+        end
+    end
+    if not hit_camp then return to end
+
+    local c = hit_camp
+    local a1 = atan2(from.y - c.center.y, from.x - c.center.x)
+    local a2 = atan2(to.y - c.center.y, to.x - c.center.x)
+    local d = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi   -- кратчайшая сторона
+    local step = (d >= 0 and 1 or -1) * math.min(math.abs(d), math.rad(55))
+    return polar(c.center, a1 + step, c.half + AVOID_MARGIN + 90)
+end
+
 local function spider_speed(npc)
     local s = safe(NPC.GetMoveSpeed, npc)
     if type(s) == "number" and s > 100 then return s end
@@ -366,15 +408,25 @@ local function camp_stacks(camp)
     return camp.stacks
 end
 
-local function camp_full(camp)
-    local full = camp_stacks(camp) >= ui.max_stacks:Get()
-    if full and not camp.full_logged then
-        camp.full_logged = true
-        log(string.format("%s: %d стака, больше не стакаю", camp.id, camp_stacks(camp)))
-    elseif not full then
-        camp.full_logged = false
+-- Секунда удара для кемпа: чем больше стаков, тем раньше (крипов больше,
+-- они дольше выходят из бокса)
+local function camp_hit(camp)
+    local shift = math.min(camp_stacks(camp) * ui.early_step:Get(), EARLY_MAX)
+    return hit_second(camp.ctype) - shift
+end
+
+-- 3 неудачи подряд — не трогаем кемп, пока его не зафармят
+local function camp_blocked(camp)
+    if not camp.blocked then return false end
+    local known = safe(Camp.GetKnownStackCount, camp.handle)
+    local farmed = safe(Camp.IsKnownClear, camp.handle)
+        or (known ~= nil and camp.block_stacks ~= nil and known < camp.block_stacks)
+    if farmed then
+        camp.blocked, camp.fails = false, 0
+        log(string.format("%s зафармлен — снова стакаю", camp.id))
+        return false
     end
-    return full
+    return true
 end
 
 ---------------------------------------------------------------------------
@@ -435,7 +487,7 @@ end
 local function unassign(sp, reason)
     local camp = sp.camp and camps[sp.camp]
     if camp then camp.spiders[sp.idx] = nil end
-    sp.camp, sp.state, sp.last_pos, sp.target = nil, ST.IDLE, nil, nil
+    sp.camp, sp.state, sp.last_pos, sp.target, sp.wp = nil, ST.IDLE, nil, nil, nil
     if reason then log(string.format("Паучок #%d: %s", sp.num, reason)) end
 end
 
@@ -467,7 +519,7 @@ local function target_camps()
     local res = {}
     if ui.mode:Get() == 1 then
         for _, id in ipairs(camp_order) do
-            if camp_selected(id) and not camp_full(camps[id]) then table.insert(res, camps[id]) end
+            if camp_selected(id) and not camp_blocked(camps[id]) then table.insert(res, camps[id]) end
         end
         return res
     end
@@ -484,7 +536,7 @@ local function target_camps()
     for _, id in ipairs(camp_order) do
         local c = camps[id]
         local type_ok = ui.types:Get(TYPE_ITEMS[c.ctype + 1]) == true
-        local side_ok = (c.own or not ui.own_only:Get()) and not camp_full(c)
+        local side_ok = (c.own or not ui.own_only:Get()) and not camp_blocked(c)
         if count_camp_spiders(c) > 0 and type_ok and side_ok then
             table.insert(cand, { camp = c, d = -1 })
         elseif type_ok and side_ok and not safe(Camp.IsKnownClear, c.handle) then
@@ -578,7 +630,7 @@ local function assign_spiders(targets, sec, minute)
             end
         end
 
-        local hit = hit_second(camp.ctype)
+        local hit = camp_hit(camp)
 
         -- 1) Основной набор: до N паучков. Каждый выходит в своё время:
         --    выход = удар - запас - время пути. Дальние уходят раньше,
@@ -646,7 +698,7 @@ local function process_spider(sp, t, minute, sec)
 
     if sp.state == ST.TO_WAIT or sp.state == ST.WAITING then
         -- момент отправки = секунда удара - время подхода - замах атаки
-        local send_at = hit_second(camp.ctype) - math.max(0, dist_center - 150) / spider_speed(sp.npc) - 0.4
+        local send_at = camp_hit(camp) - math.max(0, dist_center - 150) / spider_speed(sp.npc) - 0.4
         if sec >= send_at and sec < 58 and sp.done_minute ~= minute then
             if dist_center > camp.half + wait_gap(camp) + AGGRO_SLACK then
                 sp.done_minute = minute
@@ -665,7 +717,12 @@ local function process_spider(sp, t, minute, sec)
         else
             if dist2d(pos, wait) > 60 then
                 sp.state = ST.TO_WAIT
-                move(sp, wait)
+                -- обходим кемпы: держим промежуточную точку, пока до неё не дошли
+                if not sp.wp or dist2d(pos, sp.wp) < 90 then
+                    local nxt = detour(pos, wait)
+                    sp.wp = (nxt ~= wait) and nxt or nil
+                end
+                move(sp, sp.wp or wait)
             else
                 sp.state = ST.WAITING
             end
@@ -713,17 +770,25 @@ local function process_spider(sp, t, minute, sec)
         move(sp, retreat)
         if minute > (sp.aggro_minute or minute) and sec >= 1.5 then
             sp.done_minute = sp.aggro_minute
-            local after = safe(Camp.GetKnownStackCount, camp.handle)
-            if sp.stack_before ~= nil and after ~= nil then
-                if after > sp.stack_before then
-                    camp.stacks = after
-                    log(string.format("✔ %s застакан (%d)", camp.id, after))
+            -- итог считаем один раз на кемп за минуту (паучков может быть несколько)
+            if camp.eval_minute ~= sp.aggro_minute then
+                camp.eval_minute = sp.aggro_minute
+                local after = safe(Camp.GetKnownStackCount, camp.handle)
+                if sp.stack_before ~= nil and after ~= nil then
+                    if after > sp.stack_before then
+                        camp.stacks, camp.fails = after, 0
+                        log(string.format("✔ %s застакан (%d)", camp.id, after))
+                    else
+                        camp.fails = (camp.fails or 0) + 1
+                        log(string.format("✖ %s: стак не засчитан (%d/%d)", camp.id, camp.fails, FAIL_LIMIT))
+                        if camp.fails >= FAIL_LIMIT then
+                            camp.blocked, camp.block_stacks = true, after
+                            log(string.format("%s: %d неудачи — жду, пока зафармят", camp.id, camp.fails))
+                        end
+                    end
                 else
-                    log(string.format("✖ %s: стак не засчитан", camp.id))
+                    camp.stacks = camp.stacks + 1
                 end
-            else
-                camp.stacks = camp.stacks + 1
-                log(string.format("%s: увод завершён", camp.id))
             end
             unassign(sp)  -- свободен до следующей :40
         end
@@ -757,7 +822,7 @@ local function update_reminder(targets, sec, minute)
     -- До какого времени нужны паучки: самый ранний удар минус ~10 с на дорогу
     local first_hit = 53
     for i, c in ipairs(targets) do
-        local h = hit_second(c.ctype)
+        local h = camp_hit(c)
         if i == 1 or h < first_hit then first_hit = h end
     end
     local deadline = math.max(sec, first_hit - 10)
@@ -960,19 +1025,18 @@ local function handle_drag(x, y, w, h, btn)
     ui.panel_y:Set(math.floor(ny))
 end
 
-local function draw_pips(x, cy, filled, max)
-    for i = 1, max do
-        local col = i <= filled and P_ACCENT or P_PIP
-        Render.FilledCircle(Vec2(x + (i - 1) * 11 + 4, cy), 4, col)
-    end
-    return max * 11
+-- Бейдж с числом стаков: серый — 0, фиолетовый — есть стаки
+local function draw_badge(x, cy, stacks)
+    local label = "×" .. tostring(stacks)
+    local ts = Render.TextSize(font, 12, label)
+    local w = math.max(26, ts.x + 10)
+    Render.FilledRect(Vec2(x, cy - 8), Vec2(x + w, cy + 8), stacks > 0 and P_ACCENT or P_PIP, 8)
+    text(12, label, x + (w - ts.x) / 2, cy - ts.y / 2, C_TEXT)
 end
 
 local function draw_panel()
     local on = ui.enabled:Get()
     local pad, head_h, row_h = 10, 28, 22
-    local max = ui.max_stacks:Get()
-
     -- Содержимое
     local rows = {}
     local note = nil
@@ -981,9 +1045,8 @@ local function draw_panel()
         note = note or "Выберите кемпы в меню"
     end
     for _, c in ipairs(panel_camps()) do
-        local stacks = camp_stacks(c)
-        local view = stacks >= max and { "готово", P_ACCENT } or STATE_VIEW[camp_state(c)]
-        table.insert(rows, { name = c.id, stacks = math.min(stacks, max), state = view[1], col = view[2] })
+        local view = c.blocked and { "ждёт фарма", C_DIM } or STATE_VIEW[camp_state(c)]
+        table.insert(rows, { name = c.id, stacks = camp_stacks(c), state = view[1], col = view[2] })
     end
 
     -- Ширина по самому длинному
@@ -998,7 +1061,7 @@ local function draw_panel()
         name_w = math.max(name_w, Render.TextSize(font, 13, r.name).x)
         state_w = math.max(state_w, Render.TextSize(font, 13, r.state).x)
     end
-    w = math.max(w, pad * 2 + name_w + 14 + max * 11 + 14 + state_w)
+    w = math.max(w, pad * 2 + name_w + 14 + 34 + 14 + state_w)
     if note then w = math.max(w, pad * 2 + 16 + Render.TextSize(font, 13, note).x) end
     if #rows == 0 then rows = nil end
 
@@ -1052,7 +1115,7 @@ local function draw_panel()
         Render.FilledCircle(Vec2(x + pad + 3, my), 3, r.col)
         text(13, r.name, x + pad + 12, my - 8, C_TEXT)
         local px = x + pad + 12 + name_w + 12
-        draw_pips(px, my, r.stacks, max)
+        draw_badge(px, my, r.stacks)
         local sw = Render.TextSize(font, 13, r.state).x
         text(13, r.state, x + w - pad - sw, my - 8, r.col)
         cy = cy + row_h
@@ -1065,20 +1128,20 @@ local function draw_marks()
         local c = camps[id]
         local n = count_camp_spiders(c)
         local selected = manual and camp_selected(id)
-        if n > 0 or selected then
+        if n > 0 or selected or c.blocked then
             local sp, vis = Render.WorldToScreen(c.center)
             if vis then
-                local stacks, max = camp_stacks(c), ui.max_stacks:Get()
+                local stacks = camp_stacks(c)
                 local col, status
-                if stacks >= max then
-                    col, status = P_ACCENT, "готово"
+                if c.blocked then
+                    col, status = C_DIM, "ждёт фарма"
                 else
                     local view = STATE_VIEW[camp_state(c)]
                     status, col = view[1], view[2]
                     if n == 0 then col = C_WARN end
                 end
                 local l1 = id
-                local l2 = string.format("%s · стаков %d/%d", status, stacks, max)
+                local l2 = string.format("%s · стаков %d", status, stacks)
                 local s1 = Render.TextSize(font, 15, l1)
                 local s2 = Render.TextSize(font, 13, l2)
                 local hw = math.max(s1.x, s2.x) / 2 + 6
